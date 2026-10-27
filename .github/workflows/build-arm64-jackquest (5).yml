@@ -1147,16 +1147,55 @@ jobs:
 
           /* ---- penangan metode Java yang dipanggil game (ditambah seiring log menunjukkan yang dibutuhkan) ----
            * Metode tanpa penangan: log "(STUB)" lalu return 0 / string kosong / objek kosong. */
-          static void rh_audiotrack_write(const jv *a, jv *r) { r->i = a[2].i; }        /* AudioTrack.write(byte[],int off,int len) -> len (data dibuang untuk saat ini) */
+                   static void rh_audiotrack_write(const jv *a, jv *r) { r->i = a[2].i; }        /* AudioTrack.write(byte[],int off,int len) -> len (data dibuang untuk saat ini) */
           static void rh_min_buffer(const jv *a, jv *r) { (void)a; r->i = 4096; }       /* AudioTrack.getMinBufferSize(III)I */
           static void rh_playing_mp3(const jv *a, jv *r) { (void)a; r->z = 0; }
           static int g_gles = 2, g_quit;   /* g_gles: versi konteks GLES yang diminta (1 = ES 1.1 fixed-function, 2 = ES 2.0); g_quit: game/loader minta berhenti */
           static void rh_using_gl2(const jv *a, jv *r) { (void)a; r->i = (g_gles == 2); }            /* RunnerJNILib.UsingGL2()I */
           static void rh_exit_app(const jv *a, jv *r) { (void)a; (void)r; g_quit = 1; L("[JNI] ExitApplication -> loader berhenti\n"); }
+
+          /* ---- mock objek: nilai balik yang di Android asli TIDAK BOLEH NULL ----
+           * Di Android asli ms_context/getPackageManager()/getCacheDir() selalu non-NULL.
+           * Kalau emulator membalas NULL, game menyimpannya lalu dereference -> SIGSEGV (fault di NULL+offset). */
+          static char g_apk[300], g_save[520];   /* dipindah ke sini: dipakai mock String (sourceDir/absolutePath) */
+          static void *mock_obj(const char *cls) { return mk_obj(cls); }
+
+          /* field JNI: GetFieldID/GetStaticFieldID dibalas penunjuk FInfo supaya Get*Field tahu nama+tipenya
+           * (mis. "sourceDir" -> String path APK, "ms_context" -> objek Context). */
+          typedef struct { char name[64]; char sig[96]; int is_static; } FInfo;
+          static FInfo g_fi[128];
+          static int g_nfi;
+          static FInfo *fi_get(const void *f) { const FInfo *x = (const FInfo *)f; return (x >= g_fi && x < g_fi + g_nfi) ? (FInfo *)x : NULL; }
+          static void *field_mock(const void *fid) {
+            FInfo *f = fi_get(fid);
+            const char *n = f ? f->name : "?";
+            if (f && f->sig[0] == 'L') {
+              if (!strncmp(f->sig, "Ljava/lang/String;", 18)) {
+                if (!strcmp(n, "sourceDir")) return mk_str(g_apk[0] ? g_apk : "");
+                return mk_str("");
+              }
+              if (!strcmp(n, "ms_context")) return mock_obj("android/content/Context");
+              return mock_obj("java/lang/Object");
+            }
+            return NULL;
+          }
+          static void rh_get_udid(const jv *a, jv *r) { (void)a; r->l = mk_str("a1b2c3d4e5f60718"); }  /* Android: android_id (16 hex) */
+          static void rh_has_vsync(const jv *a, jv *r) { (void)a; r->i = 1; }                            /* Android: vsyncHandler != null -> 1 */
+          static void rh_def_fb(const jv *a, jv *r) { (void)a; r->i = 0; }                               /* DemoRenderer.m_defaultFrameBuffer (GL2 -> 0) */
+          static void rh_get_pm(const jv *a, jv *r) { (void)a; r->l = mock_obj("android/content/pm/PackageManager"); }
+          static void rh_get_cache_dir(const jv *a, jv *r) { (void)a; r->l = mock_obj("java/io/File"); }
+          static void rh_get_files_dir(const jv *a, jv *r) { (void)a; r->l = mock_obj("java/io/File"); }
+          static void rh_get_app_info(const jv *a, jv *r) { (void)a; r->l = mock_obj("android/content/pm/ApplicationInfo"); }
+          static void rh_abs_path(const jv *a, jv *r) { (void)a; r->l = mk_str(g_save[0] ? g_save : ""); }
+          static void rh_call_ext(const jv *a, jv *r) { (void)a; r->l = NULL; }   /* tanpa extension -> Java asli return null */
+
           typedef struct { const char *name; void (*fn)(const jv *, jv *); } RH;
           static const RH rh_tab[] = {
             { "write", rh_audiotrack_write }, { "getMinBufferSize", rh_min_buffer }, { "PlayingMP3", rh_playing_mp3 },
             { "UsingGL2", rh_using_gl2 }, { "ExitApplication", rh_exit_app },
+            { "GetUDID", rh_get_udid }, { "HasVsyncHandler", rh_has_vsync }, { "GetDefaultFrameBuffer", rh_def_fb },
+            { "getPackageManager", rh_get_pm }, { "getCacheDir", rh_get_cache_dir }, { "getFilesDir", rh_get_files_dir },
+            { "getApplicationInfo", rh_get_app_info }, { "getAbsolutePath", rh_abs_path }, { "CallExtensionFunction", rh_call_ext },
             { NULL, NULL }
           };
           static void mi_dispatch(const void *mid, const jv *a, jv *r) {
@@ -1235,8 +1274,25 @@ jobs:
           static int j_IsInstanceOf(void *env, void *o, void *c) { (void)env; (void)o; (void)c; return 1; }
           static void *j_GetMethodID(void *env, void *c, const char *n, const char *sig) { (void)env; return mk_method(h2s(c), n, sig, 0); }
           static void *j_GetStaticMethodID(void *env, void *c, const char *n, const char *sig) { (void)env; return mk_method(h2s(c), n, sig, 1); }
-          static void *j_GetFieldID(void *env, void *c, const char *n, const char *sig) { static char dummy[8]; (void)env; L("[JNI] GetFieldID/GetStaticFieldID(%s.%s %s) -> dummy\n", h2s(c), n, sig); return dummy; }
-          static void *j_fieldNULL(void *env, void *o, void *f) { (void)env; (void)o; (void)f; return NULL; }
+                    static void *j_GetFieldID(void *env, void *c, const char *n, const char *sig) {
+            FInfo *f;
+            (void)env;
+            if (g_nfi >= 128) { L("[JNI] tabel fieldID penuh!\n"); return &g_fi[127]; }
+            f = &g_fi[g_nfi++];
+            snprintf(f->name, sizeof f->name, "%s", n); snprintf(f->sig, sizeof f->sig, "%s", sig); f->is_static = 0;
+            L("[JNI] GetFieldID(%s.%s %s) -> #%d\n", h2s(c), n, sig, g_nfi - 1);
+            return f;
+          }
+          static void *j_GetStaticFieldID(void *env, void *c, const char *n, const char *sig) {
+            FInfo *f;
+            (void)env;
+            if (g_nfi >= 128) { L("[JNI] tabel fieldID penuh!\n"); return &g_fi[127]; }
+            f = &g_fi[g_nfi++];
+            snprintf(f->name, sizeof f->name, "%s", n); snprintf(f->sig, sizeof f->sig, "%s", sig); f->is_static = 1;
+            L("[JNI] GetStaticFieldID(%s.%s %s) -> #%d\n", h2s(c), n, sig, g_nfi - 1);
+            return f;
+          }
+          static void *j_fieldNULL(void *env, void *o, void *f) { (void)env; (void)o; return field_mock(f); }
           static long j_field0(void *env, void *o, void *f) { (void)env; (void)o; (void)f; return 0; }
           static float j_field0f(void *env, void *o, void *f) { (void)env; (void)o; (void)f; return 0.f; }
           static double j_field0d(void *env, void *o, void *f) { (void)env; (void)o; (void)f; return 0.0; }
@@ -1356,8 +1412,8 @@ jobs:
             g_jni_table[94] = (void *)j_GetFieldID;
             g_jni_table[95] = (void *)j_fieldNULL; for (i = 96; i <= 101; i++) g_jni_table[i] = (void *)j_field0; g_jni_table[102] = (void *)j_field0f; g_jni_table[103] = (void *)j_field0d;
             for (i = 104; i <= 112; i++) g_jni_table[i] = (void *)j_fieldset;
-            g_jni_table[113] = (void *)j_GetStaticMethodID; g_jni_table[144] = (void *)j_GetFieldID;
-            g_jni_table[145] = (void *)j_fieldNULL; for (i = 146; i <= 151; i++) g_jni_table[i] = (void *)j_field0; g_jni_table[152] = (void *)j_field0f; g_jni_table[153] = (void *)j_field0d;
+          g_jni_table[113] = (void *)j_GetStaticMethodID; g_jni_table[144] = (void *)j_GetStaticFieldID;
+          g_jni_table[145] = (void *)j_fieldNULL; for (i = 146; i <= 151; i++) g_jni_table[i] = (void *)j_field0; g_jni_table[152] = (void *)j_field0f; g_jni_table[153] = (void *)j_field0d;
             for (i = 154; i <= 162; i++) g_jni_table[i] = (void *)j_fieldset;
             g_jni_table[163] = (void *)j_NewString; g_jni_table[164] = (void *)j_GetStringLength; g_jni_table[165] = (void *)j_GetStringChars; g_jni_table[166] = (void *)j_ReleaseStringChars;
             g_jni_table[167] = (void *)j_NewStringUTF; g_jni_table[168] = (void *)j_GetStringLength; g_jni_table[169] = (void *)j_GetStringUTFChars; g_jni_table[170] = (void *)j_ReleaseStringUTFChars;
@@ -1515,7 +1571,7 @@ jobs:
 
           /* ---- panggilan generik ke native Java_* lewat spec ---- */
           typedef struct { int ni, nf; uint64_t i[MAXARGI]; float f[MAXARGF]; } Args;
-          static char g_apk[300], g_save[520], g_pkg[] = "ninja.netox.jackquest";
+          static char g_pkg[] = "ninja.netox.jackquest";
           static float pfloat(const char *s) {
             float sign = 1.f, v = 0.f, d = 0.1f;
             if (*s == '-') { sign = -1.f; s++; }
@@ -1581,8 +1637,37 @@ jobs:
               if (gl_init(cfg.w, cfg.h) != 0) return 1;
             }
             jni_init();
+                        jni_init();
             g_act = mk_obj("com/yoyogames/runner/RunnerActivity"); ((H *)g_act)->global = 1;
             g_cls = mk_cls("com/yoyogames/runner/RunnerJNILib");
+
+            /* folder turunan yang dipakai game: <save>/jackquestsave dan <save>/cache */
+            { char sub[600];
+              snprintf(sub, sizeof sub, "%sjackquestsave", g_save); mkdir(sub, 0755);
+              snprintf(sub, sizeof sub, "%scache", g_save); mkdir(sub, 0755); }
+
+            /* SetKeyValue: runner Android asli memanggilnya SEBELUM Startup (DemoRenderer.onSurfaceCreated).
+             * Tanpa ini key bahasa/path/dpi kosong -> game dereference NULL -> crash. */
+            { void *f_skv = mod_find(yy, "Java_com_yoyogames_runner_RunnerJNILib_SetKeyValue");
+              typedef void (*skv_fn)(void *, void *, int, int, void *);
+              char cachep[600], country[8] = "us", lang[8] = "en", rel[16] = "11", empty[4] = "";
+              void *js_cache, *js_lang, *js_rel, *js_country, *js_empty;
+              if (f_skv) {
+                snprintf(cachep, sizeof cachep, "%scache", g_save);
+                js_cache = mk_str(cachep); js_lang = mk_str(lang); js_rel = mk_str(rel);
+                js_country = mk_str(country); js_empty = mk_str(empty);
+                ((H *)js_cache)->global = ((H *)js_lang)->global = ((H *)js_rel)->global =
+                ((H *)js_country)->global = ((H *)js_empty)->global = 1;
+                L("\n== SetKeyValue (seperti runner Android asli) ==\n");
+                ((skv_fn)f_skv)(ENV, g_cls, 0, 0, js_empty);   /* 0 = isTablet */
+                ((skv_fn)f_skv)(ENV, g_cls, 1, 0, js_cache);   /* 1 = cacheDir */
+                ((skv_fn)f_skv)(ENV, g_cls, 2, 0, js_lang);    /* 2 = bahasa */
+                ((skv_fn)f_skv)(ENV, g_cls, 3, 160, js_empty); /* 3 = densityDpi */
+                ((skv_fn)f_skv)(ENV, g_cls, 4, 160, js_empty); /* 4 = densityDpi */
+                ((skv_fn)f_skv)(ENV, g_cls, 5, 30, js_rel);    /* 5 = SDK_INT + VERSION.RELEASE */
+                ((skv_fn)f_skv)(ENV, g_cls, 8, 0, js_country); /* 8 = country code */
+              } else L("[JNI] SetKeyValue TIDAK ditemukan -> key mungkin kosong (bisa jadi penyebab crash)\n");
+              local_reset(); }
 
             L("\n== initGLFuncs ==\n");
             g_phase = "initGLFuncs"; alarm((unsigned)(timeout > 0 ? timeout : 60)); t0 = now_ns();

@@ -1,0 +1,496 @@
+name: build-arm64-jackquest
+on:
+  workflow_dispatch:
+  push:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Pasang toolchain ARM 64-bit
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Tulis sumber
+        run: |
+          mkdir -p src out/jackquest/libs
+          cat > src/elfprobe64.c <<'EOF_C1'
+          /* elfprobe64 - Milestone 1 port JackQuest (Kumobius, arm64-v8a -> Linux aarch64 handheld).
+           * HANYA MEMBACA: mem-parse libyoyo.so (ELF64 AArch64), lalu cek tiap simbol impor terhadap library milik device
+           * (glibc, Mali GLESv2/EGL, SDL2, zlib). Tidak menjalankan kode game.
+           * Catatan glibc: JANGAN pakai strtol/sscanf/atoi dkk (dengan _GNU_SOURCE terikat ke GLIBC_2.38, device cuma 2.37). */
+          #define _GNU_SOURCE
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <stdint.h>
+          #include <stdarg.h>
+          #include <elf.h>
+          #include <dlfcn.h>
+          #include <fcntl.h>
+          #include <unistd.h>
+          #include <sys/mman.h>
+          #include <sys/stat.h>
+          #include <sys/utsname.h>
+          #include <gnu/libc-version.h>
+
+          #define MAXN 4096
+          #define NRT 2048
+          #ifndef DT_RELR
+          #define DT_RELR 36
+          #endif
+
+          typedef struct {
+            const uint8_t *map; size_t size;
+            const Elf64_Ehdr *eh; const Elf64_Shdr *sh; const Elf64_Phdr *ph;
+            const Elf64_Sym *sym; int nsym; const char *str;
+            const Elf64_Dyn *dyn; int ndyn;
+            unsigned rt[NRT]; unsigned nrela;
+            unsigned relr_bytes, android_packed, nload, ntls, max_align, ninit, has_init;
+            uint64_t tls_size;
+            int reloc_ok;
+          } Lib;
+
+          static FILE *rep;
+
+          static void P(const char *fmt, ...) {
+            va_list ap;
+            va_start(ap, fmt); vprintf(fmt, ap); va_end(ap);
+            if (rep) { va_start(ap, fmt); vfprintf(rep, fmt, ap); va_end(ap); }
+          }
+
+          static int load_lib(const char *path, Lib *L) {
+            struct stat st;
+            int fd, i;
+            memset(L, 0, sizeof *L);
+            fd = open(path, O_RDONLY);
+            if (fd < 0) { P("GAGAL membuka %s\n", path); return -1; }
+            if (fstat(fd, &st) != 0) { close(fd); return -1; }
+            L->size = (size_t)st.st_size;
+            L->map = mmap(NULL, L->size, PROT_READ, MAP_PRIVATE, fd, 0);
+            close(fd);
+            if (L->map == MAP_FAILED) { P("GAGAL mmap %s\n", path); return -1; }
+            if (L->size < sizeof(Elf64_Ehdr) || memcmp(L->map, ELFMAG, SELFMAG) != 0) { P("%s bukan file ELF\n", path); return -1; }
+            L->eh = (const Elf64_Ehdr *)L->map;
+            if (L->eh->e_ident[EI_CLASS] != ELFCLASS64 || L->eh->e_machine != EM_AARCH64) {
+              P("%s bukan ELF AArch64 64-bit (class=%d machine=%d)\n", path, L->eh->e_ident[EI_CLASS], L->eh->e_machine);
+              return -1;
+            }
+            if ((size_t)L->eh->e_phoff + (size_t)L->eh->e_phnum * sizeof(Elf64_Phdr) <= L->size) {
+              L->ph = (const Elf64_Phdr *)(L->map + L->eh->e_phoff);
+              for (i = 0; i < L->eh->e_phnum; i++) {
+                if (L->ph[i].p_type == PT_LOAD) { L->nload++; if (L->ph[i].p_align > L->max_align) L->max_align = (unsigned)L->ph[i].p_align; }
+                else if (L->ph[i].p_type == PT_TLS) { L->ntls++; L->tls_size = L->ph[i].p_memsz; }
+              }
+            }
+            if (L->eh->e_shoff == 0 || L->eh->e_shentsize != sizeof(Elf64_Shdr) ||
+                (size_t)L->eh->e_shoff + (size_t)L->eh->e_shnum * sizeof(Elf64_Shdr) > L->size) {
+              P("%s: section header tidak ada/rusak\n", path); return -1;
+            }
+            L->sh = (const Elf64_Shdr *)(L->map + L->eh->e_shoff);
+            for (i = 0; i < L->eh->e_shnum; i++) {
+              const Elf64_Shdr *s = &L->sh[i];
+              if ((size_t)s->sh_offset + s->sh_size > L->size) continue;
+              if (s->sh_type == SHT_DYNSYM) {
+                L->sym = (const Elf64_Sym *)(L->map + s->sh_offset);
+                L->nsym = (int)(s->sh_size / sizeof(Elf64_Sym));
+                if (s->sh_link < L->eh->e_shnum) L->str = (const char *)(L->map + L->sh[s->sh_link].sh_offset);
+              } else if (s->sh_type == SHT_DYNAMIC) {
+                L->dyn = (const Elf64_Dyn *)(L->map + s->sh_offset);
+                L->ndyn = (int)(s->sh_size / sizeof(Elf64_Dyn));
+              } else if (s->sh_type == SHT_RELA) {
+                const Elf64_Rela *r = (const Elf64_Rela *)(L->map + s->sh_offset);
+                size_t k, n = s->sh_size / sizeof(Elf64_Rela);
+                for (k = 0; k < n; k++) { unsigned t = (unsigned)ELF64_R_TYPE(r[k].r_info); L->rt[t < NRT ? t : NRT - 1]++; L->nrela++; }
+              } else if (s->sh_type == 19 /* SHT_RELR */) {
+                L->relr_bytes += (unsigned)s->sh_size;
+              } else if (s->sh_type == 0x60000001u || s->sh_type == 0x60000002u /* SHT_ANDROID_REL/RELA */) {
+                L->android_packed += (unsigned)s->sh_size;
+              }
+            }
+            if (!L->sym || !L->str) { P("%s: .dynsym tidak ditemukan\n", path); return -1; }
+            return 0;
+          }
+
+          static const char *rtname(unsigned t) {
+            switch (t) {
+              case 257: return "R_AARCH64_ABS64";
+              case 1024: return "R_AARCH64_COPY";
+              case 1025: return "R_AARCH64_GLOB_DAT";
+              case 1026: return "R_AARCH64_JUMP_SLOT";
+              case 1027: return "R_AARCH64_RELATIVE";
+              case 1028: return "R_AARCH64_TLS_DTPMOD";
+              case 1029: return "R_AARCH64_TLS_DTPREL";
+              case 1030: return "R_AARCH64_TLS_TPREL";
+              case 1031: return "R_AARCH64_TLSDESC";
+              case 1032: return "R_AARCH64_IRELATIVE";
+              default: return NULL;
+            }
+          }
+
+          static void print_header(Lib *L) {
+            int i;
+            unsigned odd = 0;
+            for (i = 0; i < L->ndyn; i++) {
+              int64_t tg = (int64_t)L->dyn[i].d_tag;
+              if (tg == DT_NEEDED) P("  NEEDED %s\n", L->str + L->dyn[i].d_un.d_val);
+              else if (tg == DT_SONAME) P("  SONAME %s\n", L->str + L->dyn[i].d_un.d_val);
+              else if (tg == DT_INIT) L->has_init = 1;
+              else if (tg == DT_INIT_ARRAYSZ) L->ninit = (unsigned)(L->dyn[i].d_un.d_val / 8);
+              else if (tg == DT_RELR || tg == DT_TEXTREL) P("  PERINGATAN: dynamic tag %ld (RELR/TEXTREL) ada -> loader harus mendukungnya\n", (long)tg);
+              else if (tg == 0x6000000f || tg == 0x60000011) P("  PERINGATAN: packed relocation Android (APS2) -> loader harus decode sendiri\n");
+            }
+            P("  PT_LOAD=%u (align maks 0x%x) | PT_TLS=%u (ukuran %llu)\n", L->nload, L->max_align, L->ntls, (unsigned long long)L->tls_size);
+            P("  konstruktor: DT_INIT=%s | init_array=%u entri\n", L->has_init ? "ada" : "tidak", L->ninit);
+            P("  relokasi RELA total=%u | RELR bytes=%u | packed Android bytes=%u\n", L->nrela, L->relr_bytes, L->android_packed);
+            for (i = 0; i < NRT; i++) if (L->rt[i]) {
+              const char *n = rtname((unsigned)i);
+              if (n) P("    %-22s %u\n", n, L->rt[i]); else P("    tipe %-17d %u\n", i, L->rt[i]);
+              if (!(i == 0 || i == 257 || i == 1025 || i == 1026 || i == 1027)) odd += L->rt[i];
+            }
+            L->reloc_ok = (odd == 0 && L->relr_bytes == 0 && L->android_packed == 0 && L->ntls == 0);
+            P("  KOMPATIBEL dengan relocator doodleloader (RELATIVE/ABS64/GLOB_DAT/JUMP_SLOT, tanpa PT_TLS/RELR/packed): %s\n",
+              L->reloc_ok ? "YA" : "TIDAK -> loader perlu ditambah");
+          }
+
+          static int starts(const char *n, const char *p) { return strncmp(n, p, strlen(p)) == 0; }
+          static int ends(const char *n, const char *p) { size_t a = strlen(n), b = strlen(p); return a >= b && !strcmp(n + a - b, p); }
+
+          /* ada di glibc tapi layout/ABI/semantik-nya BEDA dari bionic -> perlu pembungkus atau dicek */
+          static int abi_risky(const char *n) {
+            static const char *pfx[] = { "pthread_", "sem_", "stat", "fstat", "lstat", "readdir", "scandir", "opendir", "closedir",
+              "setjmp", "longjmp", "_setjmp", "_longjmp", "sigsetjmp", "siglongjmp", "sigaction", "signal", "dl", "strerror_r",
+              "__register_atfork", "dl_iterate_phdr", "_Unwind_", "__gxx_personality", "stdin", "stdout", "stderr", "syscall",
+              "getrusage", "basename", "timezone", "tzset", "newlocale", "uselocale", "freelocale", "duplocale", "localeconv",
+              "setlocale", "syslog", "openlog", "closelog", NULL };
+            int i;
+            for (i = 0; pfx[i]; i++) if (starts(n, pfx[i])) return 1;
+            return 0;
+          }
+
+          /* API Android murni (libandroid/liblog/libc bionic-only): tidak akan pernah ada di glibc, harus dishim */
+          static int android_api(const char *n) {
+            static const char *pfx[] = { "AAsset", "AAssetManager", "ALooper", "ANativeWindow", "AInput", "ASensor", "AConfiguration",
+              "AAudio", "ANativeActivity", "AndroidBitmap", "AAssetDir", "android_", "__android", "__system_property", "SL_", "slCreate", NULL };
+            int i;
+            for (i = 0; pfx[i]; i++) if (starts(n, pfx[i])) return 1;
+            return 0;
+          }
+
+          /* bionic-only di luar prefix di atas: __errno, __sF, __assert2 + keluarga fortify __*_chk / __*_chk2 (argumennya bisa beda dgn glibc) */
+          static int bionic_only(const char *n) {
+            if (!strcmp(n, "__errno") || !strcmp(n, "__sF") || !strcmp(n, "__assert2") || !strcmp(n, "__assert")) return 1;
+            if (starts(n, "__") && (ends(n, "_chk") || ends(n, "_chk2"))) return 1;
+            return 0;
+          }
+
+          static void *try_open_any(const char *label, const char **paths) {
+            int i;
+            void *h = NULL;
+            for (i = 0; paths[i]; i++) {
+              h = dlopen(paths[i], RTLD_LAZY | RTLD_LOCAL);
+              if (h) { P("  %-12s OK    : %s\n", label, paths[i]); return h; }
+            }
+            P("  %-12s TIDAK : dicoba", label);
+            for (i = 0; paths[i]; i++) P(" %s", paths[i]);
+            P("\n");
+            return NULL;
+          }
+
+          typedef struct { const char *name[MAXN]; int n; } List;
+          static void add(List *l, const char *s) { if (l->n < MAXN) l->name[l->n++] = s; }
+          static void dump(const char *title, const List *l) {
+            int i;
+            P("\n-- %s (%d)\n", title, l->n);
+            for (i = 0; i < l->n; i++) P("  %s\n", l->name[i]);
+          }
+
+          static void classify(const Lib *L, void *h_gles, void *h_mali, void *h_egl) {
+            static List ok, risky, gl, droid, bio, miss;
+            int i, nimp = 0;
+            memset(&ok, 0, sizeof ok); memset(&risky, 0, sizeof risky); memset(&gl, 0, sizeof gl);
+            memset(&droid, 0, sizeof droid); memset(&bio, 0, sizeof bio); memset(&miss, 0, sizeof miss);
+            P("\n=== libyoyo.so: klasifikasi simbol impor ===\n");
+            for (i = 1; i < L->nsym; i++) {
+              const Elf64_Sym *s = &L->sym[i];
+              const char *n;
+              if (s->st_shndx != SHN_UNDEF || !s->st_name) continue;
+              n = L->str + s->st_name;
+              nimp++;
+              if (android_api(n)) { add(&droid, n); continue; }
+              if (bionic_only(n)) { add(&bio, n); continue; }
+              if (dlsym(RTLD_DEFAULT, n)) { if (abi_risky(n)) add(&risky, n); else add(&ok, n); continue; }
+              if ((h_gles && dlsym(h_gles, n)) || (h_mali && dlsym(h_mali, n)) || (h_egl && dlsym(h_egl, n))) { add(&gl, n); continue; }
+              add(&miss, n);
+            }
+            P("total impor=%d | API Android (wajib shim)=%d | bionic-only/fortify (shim)=%d | glibc aman=%d | glibc tapi ABI/semantik beda=%d | GL/EGL device=%d | TIDAK ADA=%d\n",
+              nimp, droid.n, bio.n, ok.n, risky.n, gl.n, miss.n);
+            dump("API Android: wajib diimplementasi sendiri (shim)", &droid);
+            dump("bionic-only / fortify: shim (cek urutan argumen vs glibc)", &bio);
+            dump("ABI-RISK: ada di glibc tapi perlu dicek/pembungkus", &risky);
+            dump("TIDAK ADA di mana pun: perlu shim/implementasi sendiri", &miss);
+          }
+
+          static void gl_report(const Lib *L, void *h_gles, void *h_mali, void *h_egl) {
+            int i, total = 0, okm = 0, none = 0;
+            P("\n=== fungsi GL/EGL yang dipakai libyoyo.so ===\n");
+            P("  huruf: S=libGLESv2  M=libmali  E=libEGL  (-=tidak ada)\n");
+            for (i = 1; i < L->nsym; i++) {
+              const Elf64_Sym *s = &L->sym[i];
+              const char *n;
+              int c, m, e;
+              if (s->st_shndx != SHN_UNDEF || !s->st_name) continue;
+              n = L->str + s->st_name;
+              if (strncmp(n, "gl", 2) != 0 && strncmp(n, "egl", 3) != 0) continue;
+              if (n[0] == 'g' && n[1] == 'l' && !(n[2] >= 'A' && n[2] <= 'Z')) continue;   /* bukan fungsi GL (mis. "global...") */
+              c = h_gles && dlsym(h_gles, n) != NULL; m = h_mali && dlsym(h_mali, n) != NULL; e = h_egl && dlsym(h_egl, n) != NULL;
+              total++; if (c || m || e) okm++; else none++;
+              P("  %c%c%c %s\n", c ? 'S' : '-', m ? 'M' : '-', e ? 'E' : '-', n);
+            }
+            P("ringkas: %d fungsi GL/EGL dipakai, %d tersedia di device, %d TIDAK ADA\n", total, okm, none);
+          }
+
+          static void jni_report(const Lib *L) {
+            int i, n = 0, onload = 0;
+            P("\n=== titik masuk JNI terekspor oleh libyoyo.so ===\n");
+            for (i = 1; i < L->nsym; i++) {
+              const Elf64_Sym *s = &L->sym[i];
+              const char *nm;
+              if (s->st_shndx == SHN_UNDEF || !s->st_name) continue;
+              nm = L->str + s->st_name;
+              if (strcmp(nm, "JNI_OnLoad") == 0) { onload = 1; P("  JNI_OnLoad\n"); }
+              else if (starts(nm, "Java_")) { n++; P("  %s\n", nm + 5); }
+            }
+            P("total Java_*: %d | JNI_OnLoad: %s\n", n, onload ? "ada" : "TIDAK ADA (stage JNI_OnLoad dilewati)");
+          }
+
+          /* tanda tangan JNI valid: "(" ... ")" diikuti satu tipe (V Z B C S I J F D L[ ) */
+          static int jni_sig(const char *s) {
+            const char *p;
+            if (s[0] != '(') return 0;
+            p = strchr(s, ')');
+            if (!p || !p[1]) return 0;
+            p++;
+            while (*p == '[') p++;
+            if (*p == 'L') return strchr(p, ';') != NULL;
+            return strchr("VZBCSIJFD", *p) != NULL && p[1] == 0;
+          }
+          static int ident_like(const char *s) {
+            size_t i, n = strlen(s);
+            if (n < 3 || n > 60) return 0;
+            for (i = 0; i < n; i++) {
+              char c = s[i];
+              if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_')) return 0;
+            }
+            return 1;
+          }
+
+          /* string di binary yang menunjukkan apa yang native panggil di sisi Java: nama metode (string tepat sebelum tanda tangan) + tanda tangan + nama kelas */
+          static void string_scan(const Lib *L) {
+            static const char *seen[800];
+            int nseen = 0, hits = 0, nsig = 0;
+            size_t i, st = 0;
+            const char *prev = NULL;
+            P("\n=== string JNI di libyoyo.so (petunjuk panggilan native -> Java) ===\n");
+            P("  format: <nama-metode-kandidat>  <tanda-tangan>   (nama = string tepat sebelum tanda tangan; kandidat, bukan jaminan)\n");
+            for (i = 0; i <= L->size; i++) {
+              unsigned char c = i < L->size ? L->map[i] : 0;
+              if (c >= 32 && c < 127) continue;
+              if (c == 0 && i - st >= 3 && i - st <= 200) {
+                const char *s = (const char *)(L->map + st);
+                int sig = jni_sig(s);
+                int want = sig || strstr(s, "com/yoyogames") || starts(s, "java/") || starts(s, "android/") || starts(s, "org/") ||
+                           starts(s, "com/google") || starts(s, "javax/") || strstr(s, ".apk");
+                if (want) {
+                  char line[420];
+                  int k, dup = 0;
+                  if (sig && prev && ident_like(prev)) snprintf(line, sizeof line, "%s  %s", prev, s);
+                  else snprintf(line, sizeof line, "?  %s", s);
+                  for (k = 0; k < nseen; k++) if (strcmp(seen[k], line) == 0) { dup = 1; break; }
+                  if (!dup && nseen < 800) { seen[nseen++] = strdup(line); hits++; if (sig) nsig++; P("  %s\n", line); }
+                }
+                prev = s;
+              } else if (c == 0) prev = NULL;
+              st = i + 1;
+            }
+            P("total string JNI unik: %d (tanda tangan metode: %d)\n", hits, nsig);
+          }
+
+
+          /* nama metode kandidat INativeResponder: string camelCase berawalan kata kunci yang dipakai interface (tanpa tanda tangan; sig identik digabung linker) */
+          static void name_scan(const Lib *L) {
+            static const char *pfx[] = { "ads", "analytics", "brag", "can", "check", "cloud", "exit", "get", "iap", "is", "load", "notification",
+              "open", "play", "prompt", "score", "set", "show", "start", "stop", "unload", NULL };
+            static char *seen[400];
+            int nseen = 0;
+            size_t i, st = 0;
+            P("\n=== nama metode kandidat (camelCase, mirip INativeResponder; ada noise dari nama lain di kode game) ===\n");
+            for (i = 0; i <= L->size; i++) {
+              unsigned char c = i < L->size ? L->map[i] : 0;
+              if (c >= 32 && c < 127) continue;
+              if (c == 0 && i - st >= 6 && i - st <= 32) {
+                const char *s = (const char *)(L->map + st);
+                size_t k, n = i - st;
+                int up = 0, okc = 1, pf = 0, dup = 0;
+                for (k = 0; k < n; k++) {
+                  if (s[k] >= 'A' && s[k] <= 'Z') up++;
+                  if (!((s[k] >= 'a' && s[k] <= 'z') || (s[k] >= 'A' && s[k] <= 'Z') || (s[k] >= '0' && s[k] <= '9'))) okc = 0;
+                }
+                for (k = 0; pfx[k]; k++) if (starts(s, pfx[k])) pf = 1;
+                if (okc && up && pf && s[0] >= 'a' && s[0] <= 'z') {
+                  for (k = 0; (int)k < nseen; k++) if (!strcmp(seen[k], s)) { dup = 1; break; }
+                  if (!dup && nseen < 400) { seen[nseen++] = strdup(s); P("  %s\n", s); }
+                }
+              }
+              st = i + 1;
+            }
+            P("total nama kandidat: %d\n", nseen);
+          }
+
+          static void env_report(void *h_egl) {
+            static const char *sdl_paths[] = { "libSDL2-2.0.so.0", "/usr/lib/libSDL2-2.0.so.0", "/usr/lib/aarch64-linux-gnu/libSDL2-2.0.so.0",
+              "/usr/lib64/libSDL2-2.0.so.0", "/lib/libSDL2-2.0.so.0", NULL };
+            static const char *sdl_need[] = { "SDL_Init", "SDL_CreateWindow", "SDL_GL_CreateContext", "SDL_GL_SetAttribute", "SDL_GL_SwapWindow",
+              "SDL_PollEvent", "SDL_OpenAudioDevice", "SDL_PauseAudioDevice", "SDL_GameControllerOpen", "SDL_JoystickOpen", "SDL_GetVersion", NULL };
+            void *h; int i;
+            P("\n== SDL2 64-bit di device ==\n");
+            h = try_open_any("SDL2", sdl_paths);
+            if (h) {
+              unsigned char ver[3] = {0, 0, 0};
+              void (*gv)(void *) = NULL;
+              *(void **)&gv = dlsym(h, "SDL_GetVersion");
+              if (gv) { gv(ver); P("  SDL versi: %u.%u.%u\n", ver[0], ver[1], ver[2]); }
+              for (i = 0; sdl_need[i]; i++) P("  %-26s %s\n", sdl_need[i], dlsym(h, sdl_need[i]) ? "ada" : "TIDAK");
+            }
+            { static const char *sl_p[] = { "libOpenSLES.so", "libOpenSLES.so.1", "/usr/lib/libOpenSLES.so", NULL }; static const char *al_p[] = { "libopenal.so.1", "/usr/lib/libopenal.so.1", "/usr/lib/aarch64-linux-gnu/libopenal.so.1", NULL };
+              P("\n== audio yang diminta libyoyo (dlopen libOpenSLES.so) ==\n"); try_open_any("OpenSLES", sl_p); try_open_any("OpenAL", al_p); }
+            if (h_egl) P("  EGL: eglGetProcAddress %s | eglGetDisplay %s | eglCreateContext %s\n", dlsym(h_egl, "eglGetProcAddress") ? "ada" : "TIDAK",
+                         dlsym(h_egl, "eglGetDisplay") ? "ada" : "TIDAK", dlsym(h_egl, "eglCreateContext") ? "ada" : "TIDAK");
+            P("  (libc++: libyoyo NEEDED libc++_shared.so dari APK -> loader harus memuat DUA modul, bukan satu)\n");
+          }
+
+          int main(int argc, char **argv) {
+            Lib kg;
+            struct utsname u;
+            void *h_gles, *h_mali, *h_egl;
+            static const char *gles_p[] = { "libGLESv2.so.2", "/usr/lib/libGLESv2.so.2", "/usr/lib/aarch64-linux-gnu/libGLESv2.so.2", "/usr/lib64/libGLESv2.so.2", NULL };
+            static const char *mali_p[] = { "/usr/lib/libmali.so", "/usr/lib/libmali.so.1", "/usr/lib/aarch64-linux-gnu/libmali.so", "/usr/lib64/libmali.so", "libmali.so", NULL };
+            static const char *egl_p[] = { "libEGL.so.1", "/usr/lib/libEGL.so.1", "/usr/lib/aarch64-linux-gnu/libEGL.so.1", "/usr/lib64/libEGL.so.1", NULL };
+
+            if (argc < 2) { fprintf(stderr, "pakai: %s libyoyo.so [report.txt]\n", argv[0]); return 2; }
+            if (argc > 2) rep = fopen(argv[2], "w");
+
+            P("== elfprobe64 (JackQuest, Milestone 1) ==\n");
+            if (uname(&u) == 0) P("device: %s %s %s\n", u.sysname, u.release, u.machine);
+            P("glibc: %s | page size: %ld\n", gnu_get_libc_version(), (long)sysconf(_SC_PAGESIZE));
+
+            /* muat runtime umum supaya dlsym(RTLD_DEFAULT) mewakili apa yang tersedia untuk game */
+            dlopen("libm.so.6", RTLD_NOW | RTLD_GLOBAL);
+            dlopen("libgcc_s.so.1", RTLD_NOW | RTLD_GLOBAL);
+            dlopen("libstdc++.so.6", RTLD_NOW | RTLD_GLOBAL);
+            { static const char *z_p[] = { "libz.so.1", "/usr/lib/libz.so.1", "/usr/lib/aarch64-linux-gnu/libz.so.1", NULL }; P("\n== zlib di device (libyoyo mengimpor inflate/deflate/crc32, tidak statis) ==\n"); try_open_any("zlib", z_p) ? (void)dlopen("libz.so.1", RTLD_NOW | RTLD_GLOBAL) : (void)0; }
+
+            P("\n== library grafik 64-bit di device ==\n");
+            h_gles = try_open_any("GLESv2", gles_p);
+            h_mali = try_open_any("libmali", mali_p);
+            h_egl = try_open_any("EGL", egl_p);
+
+            env_report(h_egl);
+
+            P("\n== libyoyo.so ==\n");
+            if (load_lib(argv[1], &kg) != 0) { if (rep) fclose(rep); return 1; }
+            P("  ukuran file: %zu byte\n", kg.size);
+            print_header(&kg);
+
+            classify(&kg, h_gles, h_mali, h_egl);
+            gl_report(&kg, h_gles, h_mali, h_egl);
+            jni_report(&kg);
+            string_scan(&kg);
+            name_scan(&kg);
+
+            P("\n== selesai ==\n");
+            if (rep) fclose(rep);
+            return 0;
+          }
+          EOF_C1
+          cat > out/JackProbe.sh <<'EOF_SH1'
+          #!/bin/bash
+          # Probe JackQuest (Milestone 1, arm64 / muOS RG40XX-V). HANYA MEMBACA, tidak mengubah apa pun.
+          # Folder data dicari seperti launcher PortMaster lain: /$directory/ports/<nama>
+
+          XDG_DATA_HOME=${XDG_DATA_HOME:-$HOME/.local/share}
+
+          if [ -d "/opt/system/Tools/PortMaster/" ]; then
+            controlfolder="/opt/system/Tools/PortMaster"
+          elif [ -d "/opt/tools/PortMaster/" ]; then
+            controlfolder="/opt/tools/PortMaster"
+          elif [ -d "$XDG_DATA_HOME/PortMaster/" ]; then
+            controlfolder="$XDG_DATA_HOME/PortMaster"
+          else
+            controlfolder="/roms/ports/PortMaster"
+          fi
+
+          source $controlfolder/control.txt
+          [ -f "${controlfolder}/mod_${CFW_NAME}.txt" ] && source "${controlfolder}/mod_${CFW_NAME}.txt"
+
+          GAMEDIR="/$directory/ports/jackquest"
+          [ -d "$GAMEDIR" ] || GAMEDIR="$(cd "$(dirname "$0")" && pwd)/jackquest"
+
+          cd "$GAMEDIR" || {
+            echo "folder jackquest tidak ketemu. Dicari di: /$directory/ports/jackquest dan di sebelah script ini." > "$(dirname "$0")/probe_error.txt"
+            exit 1
+          }
+
+          chmod +x ./elfprobe64 2>/dev/null
+
+          {
+            echo "GAMEDIR=$GAMEDIR"
+            uname -a
+            echo "--- CPU"; grep -m3 -iE "model name|Hardware|CPU part|Features" /proc/cpuinfo
+            echo "--- glibc"; ldd --version 2>&1 | head -1
+            echo "--- RAM"; grep -E "MemTotal|MemAvailable" /proc/meminfo
+            echo "--- layar"; cat /sys/class/graphics/fb0/virtual_size 2>/dev/null
+            echo "--- lib grafis/audio/zlib/SDL2 di device"
+            find /usr/lib /usr/lib64 /lib /usr/local/lib -maxdepth 3 \( -name 'libGLESv2*' -o -name 'libEGL*' -o -name 'libmali*' -o -name 'libSDL2*' -o -name 'libz.so*' -o -name 'libOpenSLES*' -o -name 'libopenal*' \) 2>/dev/null | sort
+            echo "--- file di folder game"; ls -la "$GAMEDIR" "$GAMEDIR/libs" 2>&1
+          } > probe_stdout.txt 2>&1
+
+          if [ ! -f libs/libyoyo.so ]; then
+            echo "libs/libyoyo.so belum ada di $GAMEDIR/libs (ambil dari lib/arm64-v8a di APK)" > probe_report.txt
+            cat probe_report.txt >> probe_stdout.txt
+            sleep 3
+            exit 1
+          fi
+
+          ./elfprobe64 libs/libyoyo.so probe_report.txt >> probe_stdout.txt 2>&1
+          echo "exit code libyoyo: $?" >> probe_stdout.txt
+          if [ -f libs/libc++_shared.so ]; then
+            ./elfprobe64 libs/libc++_shared.so probe_report_cxx.txt >> probe_stdout.txt 2>&1
+            echo "exit code libc++_shared: $?" >> probe_stdout.txt
+          else
+            echo "PERINGATAN: libs/libc++_shared.so tidak ada (libyoyo NEEDED libc++_shared.so)" >> probe_stdout.txt
+          fi
+          sleep 2
+          type pm_finish >/dev/null 2>&1 && pm_finish
+          EOF_SH1
+          echo "Taruh libyoyo.so DAN libc++_shared.so (dari lib/arm64-v8a di APK JackQuest) ke folder ini. Jangan di-upload ke GitHub." > out/jackquest/libs/TARUH-LIB-DI-SINI.txt
+
+      - name: Kompilasi (aarch64)
+        run: |
+          aarch64-linux-gnu-gcc -O2 -Wall -Wextra -o out/jackquest/elfprobe64 src/elfprobe64.c -ldl
+          file out/jackquest/elfprobe64 || true
+          echo "--- elfprobe64: library yang dibutuhkan:"
+          aarch64-linux-gnu-readelf -d out/jackquest/elfprobe64 | grep NEEDED
+          MAXV=$(aarch64-linux-gnu-readelf -V out/jackquest/elfprobe64 | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -Vu | tail -1)
+          echo "elfprobe64 butuh GLIBC tertinggi: $MAXV (device: 2.37 atau lebih baru)"
+          if [ "$(printf '%s\n%s\n' 2.37 "$MAXV" | sort -V | tail -1)" != "2.37" ]; then
+            echo "GAGAL: elfprobe64 butuh glibc lebih baru dari 2.37. Simbol penyebab:"
+            aarch64-linux-gnu-nm -D --undefined-only out/jackquest/elfprobe64 | grep -E 'GLIBC_2\.(3[89]|[4-9][0-9])'
+            exit 1
+          fi
+
+      - name: Unggah hasil build
+        uses: actions/upload-artifact@v4
+        with:
+          name: jackquest-arm64
+          path: out
